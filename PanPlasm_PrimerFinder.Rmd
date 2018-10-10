@@ -1,0 +1,335 @@
+---
+title: "Pan Plasmodium 18s Interrogation"
+author: "Nicholas F. Brazeau"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  html_document:
+    highlight: textmate
+    theme: lumen
+    toc: yes
+    toc_float: yes
+    toc_depth: 2
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r packages, echo=F, warning=F, message=F, warning=F, message=F, results='hide'}
+
+# datawrangle
+library(tidyverse)
+library(stringr)
+library(DT)
+library(parallel)
+
+# Genomics
+library(rentrez)
+library(Biostrings)
+library(ape)
+
+# plotting
+library(RColorBrewer)
+library(plotly)
+
+speciesnamefinder <- function(ncbiname){
+  
+  ncbiname <- tolower(ncbiname)
+  ncbiname <- unlist(str_split(ncbiname, pattern=" "))
+  tfret <- c("falciparum", "vivax", "malariae", "ovale", "knowlesi") %in% ncbiname
+  if(any(tfret == TRUE)){
+    ret <- c("falciparum", "vivax", "malariae", "ovale", "knowlesi")[tfret]
+  } else {
+    ret <- "other"
+  }
+  return(ret)
+}
+
+fastafinder <- function(fa, start, end, centerdist = 50){
+  ret <- fa[start:end]
+  return(ret)
+}
+
+```
+
+# Overview
+Jon wants to design primers for 18s that are Pan-sensitivie but are discriminatory at the species-level. We have two primer candidates from [Manigold et al. 2005](https://www.ncbi.nlm.nih.gov/pubmed/15872277) and [Lefterova et al. 2015](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4473218/).   
+To see how the primers are doing, I am going to query the _NCBI Nucleotide Database_ and pull down all 18S sequences that are publicly available. I will then do a quick filter and align the primers to these sequences.    
+**Let the primer set with the most hits when**. 
+
+## Primers 
+```{r, echo=F, warning=F, message=F}
+primers <- Biostrings::readDNAStringSet(filepath = "PrimerQueries.fasta")
+manigoldfw <- primers[[1]]
+manigoldrv <- Biostrings::reverseComplement(primers[[2]])
+lefterovafw <- primers[[3]]
+lefterovarv <- Biostrings::reverseComplement(primers[[4]])
+
+```
+
+## Query
+```{r, echo=F, warning=F, message=F}
+
+
+query <- "plasmodium[ORGN] OR Plasmodium[ORGN]  AND (18S OR 18s OR 18S ribosomal RNA)"
+
+panPlas18S.search <- rentrez::entrez_search(db= "nucleotide", query,
+                                         retmax = 1e4,
+                                         use_history = T)
+
+```
+With the above query, we returned `r prettyNum(length(panPlas18S.search$ids), big.mark = ",")` hits. Now going to download the consensus sequences associated with each ID. 
+
+## Scrape
+
+```{r, echo=F, warning=F, message=F}
+
+fasta_mtdt_fetch <- function(id){
+  f <- rentrez::entrez_fetch(db="nucleotide", rettype="fasta", id = id)
+  Sys.sleep(5)
+  m <- rentrez::entrez_summary(db="nucleotide", id = id)
+  ret <- list(fasta = f, 
+              metadata = m)
+  return(ret)
+}
+
+# fetch
+p18sdt <- parallel::mclapply(panPlas18S.search$ids, fasta_mtdt_fetch)
+# parse
+p18smtdt <- purrr::map(p18sdt, `[[`, "metadata")
+p18smtdt <- purrr::map_df(p18smtdt, `[`, c("organism", "strain", "slen"))
+outfastas <- purrr::map(p18sdt, `[[`, "fasta")
+write.table(x=outfastas, file="temp/outfasta.fasta", quote = F, col.names = F, row.names = F, sep = "")
+
+p18sf <- Biostrings::readDNAStringSet(filepath = "temp/outfasta.fasta", format = "fasta")
+
+# drop sequences with very small lengths
+p18sf <- p18sf[p18sf@ranges@width >= 100]
+p18smtdt <- p18smtdt[p18smtdt$slen >= 100, ]
+
+# make a link here
+p18smtdt$names <- names(p18sf)
+
+```
+### Summary of Scrape
+With the above query, scrape, and excluding sequences that are less than 200 bp in length (people submitting little pieces of 18s), we returned `r prettyNum(length(p18smtdt$names), big.mark = ",")` hits. Now to test our primer sets. 
+
+
+
+
+### Manigold Hits
+I'm allowing one mismatch...asuming primers will still land if other bases are good. 
+```{r, echo=F, warning=F, message=F}
+manigoldhits <- lapply(list(manigoldfw, manigoldrv), function(x) {
+    Biostrings::vmatchPattern(as.character(x), p18sf, max.mismatch = 1) # I am allowing one mismatch
+  })
+
+
+
+
+
+manigoldhits_Fw <- Biostrings::vmatchPattern(as.character(manigoldfw), p18sf)
+manigoldhits_Fw <- manigoldhits_Fw[ !sapply(manigoldhits_Fw@ends, is.null) ] # drop non-hits 
+
+manigoldhits_Rv <- Biostrings::vmatchPattern(as.character(manigoldrv), p18sf)
+manigoldhits_Rv <- manigoldhits_Rv[ !sapply(manigoldhits_Rv@ends, is.null) ] # drop non-hits 
+
+
+
+manigoldhits_Fw_tbl <- tibble(names = manigoldhits_Fw@NAMES, 
+                              Fwends = unlist(manigoldhits_Fw@ends),
+                              Fwwidth = manigoldhits_Fw@width0)
+
+
+manigoldhits_Rv_tbl <- tibble(names = manigoldhits_Rv@NAMES, 
+                              Rvends = unlist(manigoldhits_Rv@ends),
+                              Rvwidth = manigoldhits_Rv@width0)
+
+
+manigoldhits <- dplyr::inner_join(manigoldhits_Fw_tbl, manigoldhits_Rv_tbl, by=c("names"))
+
+manigoldhits <- manigoldhits %>% 
+  dplyr::mutate(ampliconlength = Rvends - Fwends + 1) %>% 
+  dplyr::left_join(x=., y=p18smtdt, by = c("names")) %>% 
+  dplyr::mutate(species = sapply(organism, speciesnamefinder))
+
+
+
+```
+
+#### Large Table
+```{r, echo=F, warning=F, message=F}
+manigoldhits %>% 
+  dplyr::select(names, ampliconlength, species) %>% 
+DT::datatable(., extensions='Buttons',
+               options = list(
+              searching = T,
+              pageLength = 20,
+              dom = 'Bfrtip', 
+              buttons = c('csv')))
+
+```
+#### Summary By Species Table
+```{r, echo=F, warning=F, message=F}
+summanigoldhits <- manigoldhits %>% 
+  dplyr::group_by(species) %>% 
+  dplyr::summarise(n=n(), avg_ampliconlength = mean(ampliconlength), sd_ampliconlength = sd(ampliconlength)) %>% 
+  dplyr::mutate_if(is.numeric, round, 2)
+
+DT::datatable(summanigoldhits, extensions='Buttons',
+               options = list(
+              searching = T,
+              pageLength = 20,
+              dom = 'Bfrtip', 
+              buttons = c('csv')))
+
+```
+
+### Manigold Genetic Analysis
+```{r, echo=F, warning=F, message=F}
+manigoldfasta_subset <- p18sf[names(p18sf) %in% manigoldhits$names]
+manigoldfasta_subset <- parallel::mcmapply(fastafinder, fa = as.list(manigoldfasta_subset), start =  manigoldhits$Fwends, end =  manigoldhits$Rvends)
+
+fastringdist <- Biostrings::stringDist(DNAStringSet(manigoldfasta_subset), method = "levenshtein")
+fit <- cmdscale(fastringdist,eig=TRUE, k=3) # k is the number of dim
+
+
+eigpoints <- as.data.frame(fit$points)
+colnames(eigpoints) <- c("PC1", "PC2", "PC3")
+
+# color scheme
+colorsample <- data.frame(species = c("falciparum", "vivax", "malariae", "ovale", "knowlesi", "other"),
+           color = RColorBrewer::brewer.pal(6, "Dark2"))
+  
+eigpoints$names <- factor(manigoldhits$names)
+eigpoints$species <- factor(manigoldhits$species)
+
+eigpoints <- left_join(eigpoints, colorsample, by=c("species"))
+
+# PCA
+library(plotly)
+Sys.setenv("plotly_username"="nbrazeau1")
+Sys.setenv("plotly_api_key"="ePqTRUO0K7qUlYc8DffD")
+
+psample <- plot_ly(eigpoints, x = ~PC1, y = ~PC3, z = ~PC2, color = ~species, colors = as.character(colorsample$color),
+                   text = ~paste('Name of Hit: ', eigpoints$names)) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'PC1'),
+                     yaxis = list(title = 'PC3'),
+                     zaxis = list(title = 'PC2')))
+
+psample
+
+```
+
+
+### Lefterova Hits
+I'm allowing one mismatch...asuming primers will still land if other bases are good. 
+**Of note, there were multimappers in the forward primers that I got rid of through a hacky solution. We should think about why they hit so close on the same sample**.
+```{r, echo=F, warning=F, message=F}
+lefterovahits <- lapply(list(lefterovafw, lefterovarv), function(x) {
+    Biostrings::vmatchPattern(as.character(x), p18sf, max.mismatch = 1) # I am allowing one mismatch
+  })
+
+
+lefterovahits_Fw <- Biostrings::vmatchPattern(as.character(lefterovafw), p18sf)
+lefterovahits_Fw <- lefterovahits_Fw[ !sapply(lefterovahits_Fw@ends, is.null) ] # drop non-hits 
+
+lefterovahits_Rv <- Biostrings::vmatchPattern(as.character(lefterovarv), p18sf)
+lefterovahits_Rv <- lefterovahits_Rv[ !sapply(lefterovahits_Rv@ends, is.null) ] # drop non-hits 
+
+
+
+
+
+lefterovahits_Fw_tbl <- tibble(names = lefterovahits_Fw@NAMES[which(unlist(map(lefterovahits_Fw@ends, length)) == 1)], 
+                              Fwends = unlist(lefterovahits_Fw@ends[which(unlist(map(lefterovahits_Fw@ends, length)) == 1)]),
+                              Fwwidth = lefterovahits_Fw@width0[which(unlist(map(lefterovahits_Fw@ends, length)) == 1)])
+
+
+lefterovahits_Rv_tbl <- tibble(names = lefterovahits_Rv@NAMES, 
+                              Rvends = unlist(lefterovahits_Rv@ends),
+                              Rvwidth = lefterovahits_Rv@width0)
+
+
+lefterovahits <- dplyr::inner_join(lefterovahits_Fw_tbl, lefterovahits_Rv_tbl, by=c("names"))
+
+
+lefterovahits <- lefterovahits %>% 
+  dplyr::mutate(ampliconlength = Rvends - Fwends + 1) %>% 
+  dplyr::left_join(x=., y=p18smtdt, by = c("names")) %>% 
+  dplyr::mutate(species = sapply(organism, speciesnamefinder))
+
+
+```
+
+#### Large Table
+```{r, echo=F, warning=F, message=F}
+lefterovahits %>% 
+  dplyr::select(names, ampliconlength, species) %>% 
+DT::datatable(., extensions='Buttons',
+               options = list(
+              searching = T,
+              pageLength = 20,
+              dom = 'Bfrtip', 
+              buttons = c('csv')))
+
+```
+#### Summary By Species Table
+```{r, echo=F, warning=F, message=F}
+sumlefterovahits <- lefterovahits %>% 
+  dplyr::group_by(species) %>% 
+  dplyr::summarise(n=n())
+
+DT::datatable(sumlefterovahits, extensions='Buttons',
+               options = list(
+              searching = T,
+              pageLength = 20,
+              dom = 'Bfrtip', 
+              buttons = c('csv')))
+
+```
+
+### Lefterova Genetic Analysis
+```{r, echo=F, warning=F, message=F}
+lefterovafasta_subset <- p18sf[names(p18sf) %in% lefterovahits$names]
+lefterovafasta_subset <- parallel::mcmapply(fastafinder, fa = as.list(lefterovafasta_subset), start =  lefterovahits$Fwends, end =  lefterovahits$Rvends)
+
+fastringdist <- Biostrings::stringDist(DNAStringSet(lefterovafasta_subset), method = "levenshtein")
+fit <- cmdscale(fastringdist,eig=TRUE, k=3) # k is the number of dim
+
+
+eigpoints <- as.data.frame(fit$points)
+colnames(eigpoints) <- c("PC1", "PC2", "PC3")
+
+# color scheme
+colorsample <- data.frame(species = c("falciparum", "vivax", "malariae", "ovale", "knowlesi", "other"),
+                          color = RColorBrewer::brewer.pal(6, "Dark2"))
+
+eigpoints$names <- factor(lefterovahits$names)
+eigpoints$species <- factor(lefterovahits$species)
+
+eigpoints <- left_join(eigpoints, colorsample, by=c("species"))
+
+# PCA
+library(plotly)
+Sys.setenv("plotly_username"="nbrazeau1")
+Sys.setenv("plotly_api_key"="ePqTRUO0K7qUlYc8DffD")
+
+psample <- plot_ly(eigpoints, x = ~PC1, y = ~PC3, z = ~PC2, color = ~species, colors = as.character(colorsample$color),
+                   text = ~paste('Name of Hit: ', eigpoints$names)) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC3'),
+                      zaxis = list(title = 'PC2')))
+
+psample
+
+```
+
+
+
+
+
